@@ -156,6 +156,11 @@ private:
     }
 
 public:
+    // Out archive properties set so far. 7-Zip resets all properties on every ISetProperties::SetProperties() call,
+    // so each call has to pass all of them again.
+    UStringVector _outArchivePropertyNames;
+    CObjectVector<NWindows::NCOM::CPropVariant> _outArchivePropertyValues;
+
     JBindingSession(JNIEnv * initEnv) {
         if (!_vm && initEnv->GetJavaVM(&_vm)) {
             fatal("Can't get JavaVM from JNIEnv");

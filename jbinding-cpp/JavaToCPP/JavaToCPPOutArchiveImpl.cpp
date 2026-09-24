@@ -28,6 +28,38 @@ static IOutArchive * GetArchive(JNIEnv * env, jobject thiz) {
     return (IOutArchive *) (void *) (size_t) pointer;
 }
 
+// 7-Zip handlers reset all properties to their defaults on every SetProperties() call,
+// so pass the new property together with all properties set on this archive before.
+static HRESULT SetOutArchiveProperty(JBindingSession & jbindingSession, ISetProperties * setProperties,
+        const wchar_t * name, const NWindows::NCOM::CPropVariant & value) {
+    UStringVector & names = jbindingSession._outArchivePropertyNames;
+    CObjectVector<NWindows::NCOM::CPropVariant> & values = jbindingSession._outArchivePropertyValues;
+
+    int index = -1;
+    for (unsigned i = 0; i < names.Size(); i++) {
+        if (names[i] == name) {
+            index = (int) i;
+            break;
+        }
+    }
+    if (index < 0) {
+        names.Add(UString(name));
+        values.Add(value);
+    } else {
+        values[index] = value;
+    }
+
+    CRecordVector<const wchar_t *> namePointers;
+    NWindows::NCOM::CPropVariant * propValues = new NWindows::NCOM::CPropVariant[values.Size()];
+    for (unsigned i = 0; i < names.Size(); i++) {
+        namePointers.Add(names[i]);
+        propValues[i] = values[i];
+    }
+    HRESULT result = setProperties->SetProperties(&namePointers.Front(), propValues, namePointers.Size());
+    delete[] propValues;
+    return result;
+}
+
 /*
  * Class:     net_sf_sevenzipjbinding_impl_OutArchiveImpl
  * Method:    updateItemsNative
@@ -118,7 +150,7 @@ JNIEXPORT void JNICALL Java_net_sf_sevenzipjbinding_impl_OutArchiveImpl_nativeSe
     CRecordVector<const wchar_t *> names;
     names.Add(L"X");
 
-    result = setProperties->SetProperties(&names.Front(), propValues, names.Size());
+    result = SetOutArchiveProperty(jbindingSession, setProperties, names[0], propValues[0]);
     if (result) {
         TRACE("Error setting 'Level' property. Result: 0x" << std::hex << result)
         jniNativeCallContext.reportError(result, "Error setting 'Level' property.");
@@ -162,7 +194,7 @@ JNIEXPORT void JNICALL Java_net_sf_sevenzipjbinding_impl_OutArchiveImpl_nativeSe
     CRecordVector<const wchar_t *> names;
     names.Add(L"HE"); // See 7zHandlerOut.cpp:823
 
-    result = setProperties->SetProperties(&names.Front(), propValues, names.Size());
+    result = SetOutArchiveProperty(jbindingSession, setProperties, names[0], propValues[0]);
     if (result) {
         TRACE("Error setting 'Header Encryption' property. Result: 0x" << std::hex << result)
         jniNativeCallContext.reportError(result, "Error setting 'Header Encryption' property.");
@@ -209,7 +241,7 @@ JNIEXPORT void JNICALL Java_net_sf_sevenzipjbinding_impl_OutArchiveImpl_nativeSe
     CRecordVector<const wchar_t *> names;
     names.Add(L"S");
 
-    result = setProperties->SetProperties(&names.Front(), propValues, names.Size());
+    result = SetOutArchiveProperty(jbindingSession, setProperties, names[0], propValues[0]);
     if (result) {
         TRACE("Error setting 'Solid' property. Result: 0x" << std::hex << result)
         jniNativeCallContext.reportError(result, "Error setting 'Solid' property.");
@@ -257,7 +289,7 @@ JNIEXPORT void JNICALL Java_net_sf_sevenzipjbinding_impl_OutArchiveImpl_nativeSe
     CRecordVector<const wchar_t *> names;
     names.Add(L"MT");
 
-    result = setProperties->SetProperties(&names.Front(), propValues, names.Size());
+    result = SetOutArchiveProperty(jbindingSession, setProperties, names[0], propValues[0]);
     if (result) {
         TRACE("Error setting 'Multithreading' property. Result: 0x" << std::hex << result)
         jniNativeCallContext.reportError(result, "Error setting 'Multithreading' property.");
