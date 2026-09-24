@@ -37,4 +37,8 @@ Session.vim
 
 /compile_commands.json
 /.cache/
+/.sevenzip-cross/
 /.clangd/
+build*/
+.idea/
+*.iml

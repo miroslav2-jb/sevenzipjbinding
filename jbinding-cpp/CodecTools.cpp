@@ -27,6 +27,7 @@ void CodecTools::init() {
 	}
 #endif // TRACE_ON
 
+	cabIndex = -1;
 	gzipIndex = -1;
 	bzip2Index = -1;
 	xzIndex = -1;

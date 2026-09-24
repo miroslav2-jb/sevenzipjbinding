@@ -409,6 +409,9 @@ IF(BUILD_TESTING)
        FILE(APPEND ${JUNIT_TEST_RUNNER} "\"-Dskip-debug-mode-tests=true\" ")
     ENDIF()
 
+    # 7z-only native build: skip tests of archive formats that are not compiled in
+    FILE(APPEND ${JUNIT_TEST_RUNNER} "\"-Dsevenziptest.excluded-tests=${PROJECT_SOURCE_DIR}/test/JavaTests/7z-only-excluded-tests.txt\" ")
+
     FILE(APPEND ${JUNIT_TEST_RUNNER} "org.junit.runner.JUnitCore net.sf.sevenzipjbinding.junit.AllTestSuite
                                             WORKING_DIRECTORY ${JAVA_TEST_SOURCE_DIR}/..
                                             RESULT_VARIABLE RESULT)

@@ -1,7 +1,16 @@
 package net.sf.sevenzipjbinding.junit;
 
+import java.io.BufferedReader;
+import java.io.FileInputStream;
+import java.io.InputStreamReader;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
+
+import org.junit.runner.Description;
+import org.junit.runner.manipulation.Filter;
+import org.junit.runner.manipulation.NoTestsRemainException;
 
 import junit.framework.JUnit4TestAdapter;
 import junit.framework.Test;
@@ -511,8 +520,69 @@ public class AllTestSuite extends TestSuite {
         tests.put("Misc tests", miscTests);
     }
 
+    /**
+     * Optional file with tests to skip: one fully qualified test class or one exact JUnit test description per line
+     * ('#' starts a comment). Used by the 7z-only native build, where the other archive formats are not compiled in.
+     */
+    static final String EXCLUDED_TESTS_FILE_PROPERTY = "sevenziptest.excluded-tests";
+
+    static Filter excludedTestsFilter;
+
+    static void addTest(TestSuite testSuite, Class<?> testClass) {
+        JUnit4TestAdapter adapter = new JUnit4TestAdapter(testClass);
+        if (excludedTestsFilter != null) {
+            try {
+                adapter.filter(excludedTestsFilter);
+            } catch (NoTestsRemainException e) {
+                return;
+            }
+        }
+        testSuite.addTest(adapter);
+    }
+
+    static Filter loadExcludedTestsFilter() throws Exception {
+        String fileName = System.getProperty(EXCLUDED_TESTS_FILE_PROPERTY);
+        if (fileName == null || fileName.trim().length() == 0) {
+            return null;
+        }
+        final Set<String> excluded = new HashSet<String>();
+        BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(fileName), "UTF-8"));
+        try {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+                if (line.length() > 0 && !line.startsWith("#")) {
+                    excluded.add(line);
+                }
+            }
+        } finally {
+            reader.close();
+        }
+        return new Filter() {
+            @Override
+            public boolean shouldRun(Description description) {
+                if (!description.isTest()) {
+                    for (Description child : description.getChildren()) {
+                        if (shouldRun(child)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                return !excluded.contains(description.getClassName())
+                        && !excluded.contains(description.getDisplayName());
+            }
+
+            @Override
+            public String describe() {
+                return "tests excluded by " + EXCLUDED_TESTS_FILE_PROPERTY;
+            }
+        };
+    }
+
     public static Test suite() throws Exception {
         setSystemPropretyIfNotAlready(TestConfiguration.TEST_PARAM__TRACE, "false");
+        excludedTestsFilter = loadExcludedTestsFilter();
 
         String singleBundle = System.getProperty("SINGLEBUNDLE");
         if (singleBundle != null) {
@@ -523,7 +593,7 @@ public class AllTestSuite extends TestSuite {
             }
             TestSuite testSuite = new TestSuite(singleBundle);
             for (Class<?> testClass : classes) {
-                testSuite.addTest(new JUnit4TestAdapter(testClass));
+                addTest(testSuite, testClass);
             }
             return testSuite;
         }
@@ -532,7 +602,7 @@ public class AllTestSuite extends TestSuite {
         for (String testBundle : tests.keySet()) {
             TestSuite testSuite = new TestSuite(testBundle);
             for (Class<?> testClass : tests.get(testBundle)) {
-                testSuite.addTest(new JUnit4TestAdapter(testClass));
+                addTest(testSuite, testClass);
             }
             allTestSuite.addTest(testSuite);
         }

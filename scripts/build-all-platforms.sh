@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Builds sevenzipjbinding-all-platforms-<version>.jar (12 native platforms) on a macOS host.
+# Builds sevenzipjbinding-all-platforms-<version>-<suffix>.jar (12 native platforms) on a macOS host.
 #
 #  - Mac (universal x86_64 + arm64): native build, flags from .github/workflows/macos.yml plus
 #    CMAKE_OSX_DEPLOYMENT_TARGET=14.0 (the published 23.01-2.2 dylib has minos 14.0).
@@ -12,36 +12,48 @@
 #  - Merge: scripts/build-multiplatform-release.sh (needs GNU tools, so it runs in a Linux container).
 #
 # Requirements: macOS with Xcode command line tools, a local JDK 8 (/usr/libexec/java_home -v 1.8),
-# python3, curl, podman with a running machine. Network access for downloads and image pulls.
+# python3, curl, docker with a running daemon. Network access for downloads and image pulls.
 #
 # Usage:
-#   build-all-platforms.sh [build]   builds the platforms not built yet, then merges all of them.
+#   build-all-platforms.sh build <suffix>
+#                                    builds the platforms not built yet, then merges all of them.
+#                                    <suffix> (required, e.g. "stripped") is appended to the version
+#                                    of the result jar and pom: <version>-<suffix>. The platform
+#                                    builds keep the plain version.
 #                                    A platform counts as built when build-<platform>/ holds its zip;
 #                                    a build directory without the zip is removed and rebuilt.
 #                                    Sources are not compared: after changing them run "cleanup" first
 #                                    (or delete the affected build-<platform> directories).
-#   build-all-platforms.sh cleanup   removes everything: build-* directories, WORK_DIR and CACHE_DIR
-#                                    (podman images are kept)
+#   build-all-platforms.sh cleanup   removes build-* directories and .sevenzip-cross
+#                                    (.cache and docker images are kept)
 #
 # Environment:
-#   WORK_DIR       work directory, recreated on every build run (default: $HOME/sevenzip-cross)
-#   CACHE_DIR      downloads, CMake venv and apk/apt package caches, kept between build runs
-#                  (default: $HOME/.cache/sevenzipjbinding-build)
-#   RUN_MAC_TESTS  set to 1 to run ctest for the Mac build (slow)
+#   RUN_MAC_TESTS   set to 1 to run ctest for the Mac build (slow)
+#   RUN_LINUX_TESTS set to 1 to run ctest for Linux-amd64, Linux-arm64, Linux-amd64-musl and
+#                   Linux-arm64-musl in containers of the target architecture (slow). The other
+#                   platforms can't run on a Mac: Apple CPUs have no 32-bit x86/ARM mode.
 #
-# Result: $WORK_DIR/out/sevenzipjbinding-all-platforms-<version>.jar
+# Directories (in the source root):
+#   .sevenzip-cross work directory, recreated on every build run
+#   .cache          downloads, CMake venv and apk/apt package caches, kept between build runs
+#                   and by "cleanup"; delete it manually to re-download
+#
+# Result: .sevenzip-cross/out/sevenzipjbinding-all-platforms-<version>-<suffix>.jar and .pom
+#         (the pom is scripts/sevenzipjbinding-all-platforms-<version>.pom with the version suffixed)
 
 set -euo pipefail
 shopt -s nullglob
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
-W="${WORK_DIR:-$HOME/sevenzip-cross}"
-CACHE="${CACHE_DIR:-$HOME/.cache/sevenzipjbinding-build}"
+W="$SRC/.sevenzip-cross"
+CACHE="$SRC/.cache"
 VERSION="$(sed -n 's/^SET(SEVENZIPJBINDING_VERSON \(.*\))$/\1/p' "$SRC/CMakeLists.txt")"
 
 DOCKCROSS_TAG=20201222-0217db3
 DOCKCROSS_WINDOWS_TAG=20201116-0216d09
 JDK8_LINUX_X64_URL=https://corretto.aws/downloads/latest/amazon-corretto-8-x64-linux-jdk.tar.gz
+# Only for RUN_LINUX_TESTS: the JVM that runs the Linux-arm64 tests
+JDK8_LINUX_ARM64_URL=https://corretto.aws/downloads/latest/amazon-corretto-8-aarch64-linux-jdk.tar.gz
 JDK8_WINDOWS_X64_URL=https://corretto.aws/downloads/latest/amazon-corretto-8-x64-windows-jdk.zip
 # The manylinux2010-x86 image has a 32-bit userland only, and Corretto has no 32-bit Linux build
 JDK8_LINUX_X86_URL=https://cdn.azul.com/zulu/bin/zulu8.96.0.205-ca-jdk8.0.504-linux_i686.tar.gz
@@ -96,30 +108,31 @@ remove_in_source_leftovers() {
       jbinding-java/MANIFEST.MF jbinding-java/test-MANIFEST.MF jbinding-java/sevenzipjbinding*.jar)
 }
 
-MODE="${1:-build}"
+MODE="${1:-}"
+SUFFIX="${2:-}"
 case "$MODE" in
-  build | cleanup) ;;
-  *) echo "Usage: $0 [build|cleanup]" >&2; exit 2 ;;
-esac
-
-[[ -n "$W" && "$W" != "/" && "$W" != "$HOME" && "$W" != "$SRC" ]] || fail "unsafe WORK_DIR: '$W'"
-[[ -n "$CACHE" && "$CACHE" != "/" && "$CACHE" != "$HOME" && "$CACHE" != "$SRC" ]] || fail "unsafe CACHE_DIR: '$CACHE'"
-[[ "$CACHE" != "$W" && "$CACHE" != "$W"/* ]] || fail "CACHE_DIR must be outside WORK_DIR: '$CACHE'"
+  build) [[ $# == 2 && -n "$SUFFIX" ]] ;;
+  cleanup) [[ $# == 1 ]] ;;
+  *) false ;;
+esac || { echo "Usage: $0 build <suffix> | cleanup" >&2; exit 2; }
+[[ "$MODE" == cleanup || "$SUFFIX" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail "invalid suffix: '$SUFFIX'"
+RESULT_VERSION="$VERSION-$SUFFIX"
+POM_TEMPLATE="$SRC/scripts/sevenzipjbinding-all-platforms-$VERSION.pom"
 
 if [[ "$MODE" == cleanup ]]; then
-  step "Cleanup: build directories, $W and $CACHE"
-  rm -rf "$SRC"/build-* "$W" "$CACHE"
+  step "Cleanup: build directories and $W (cache $CACHE is kept)"
+  rm -rf "$SRC"/build-* "$W"
   remove_in_source_leftovers
   echo "Done"
   exit 0
 fi
 
 # ---------------------------------------------------------------------------------------------
-step "0/8 Preflight"
+step "0/10 Preflight"
 [[ "$(uname -s)" == Darwin ]] || fail "run this on macOS"
 [[ -n "$VERSION" ]] || fail "cannot read SEVENZIPJBINDING_VERSON from $SRC/CMakeLists.txt"
-command -v podman >/dev/null || fail "podman not found"
-podman info >/dev/null 2>&1 || fail "podman machine is not running (podman machine start)"
+command -v docker >/dev/null || fail "docker not found"
+docker info >/dev/null 2>&1 || fail "docker daemon is not running"
 command -v curl >/dev/null || fail "curl not found"
 command -v python3 >/dev/null || fail "python3 not found"
 xcrun --show-sdk-version >/dev/null || fail "Xcode command line tools not found"
@@ -128,17 +141,20 @@ MAC_JDK8="$(/usr/libexec/java_home -v 1.8)" || fail "local JDK 8 not found"
 echo "Source:  $SRC"
 echo "Work:    $W"
 echo "Cache:   $CACHE"
-echo "Version: $VERSION"
+[[ -f "$POM_TEMPLATE" ]] || fail "missing $POM_TEMPLATE"
+grep -qF "<version>$VERSION</version>" "$POM_TEMPLATE" || fail "no <version>$VERSION</version> in $POM_TEMPLATE"
+echo "Version: $VERSION (result: $RESULT_VERSION)"
 
 # ---------------------------------------------------------------------------------------------
-step "1/8 Clean up temp files (built platforms are kept)"
+step "1/10 Clean up temp files (built platforms are kept)"
 rm -rf "$W"
 remove_in_source_leftovers
 rm -f "$CACHE"/*.part
-mkdir -p "$W/dist" "$W/out" "$CACHE/apk" "$CACHE/apt-archives" "$CACHE/apt-lists"
+mkdir -p "$W/dist" "$W/out" "$CACHE/apk" "$CACHE/apt-archives" "$CACHE/apt-lists" \
+  "$CACHE/apk-arm64" "$CACHE/apt-archives-arm64" "$CACHE/apt-lists-arm64"
 
 # ---------------------------------------------------------------------------------------------
-step "2/8 Download JDKs and musl toolchains (cached in $CACHE)"
+step "2/10 Download JDKs and musl toolchains (cached in $CACHE)"
 fetch "$JDK8_LINUX_X64_URL" jdk8-linux-x64.tar.gz
 fetch "$JDK8_LINUX_X86_URL" jdk8-linux-x86.tar.gz
 fetch "$JDK8_WINDOWS_X64_URL" jdk8-windows.zip
@@ -151,6 +167,11 @@ tar -xzf "$CACHE/jdk8-linux-x64.tar.gz" --strip-components=1 -C "$W/jdk8-linux-x
 mkdir -p "$W/jdk8-linux-x86"
 tar -xzf "$CACHE/jdk8-linux-x86.tar.gz" --strip-components=1 -C "$W/jdk8-linux-x86"
 [[ -f "$W/jdk8-linux-x86/bin/javah" ]] || fail "32-bit Linux JDK 8 has no javah"
+if [[ "${RUN_LINUX_TESTS:-0}" == 1 ]]; then
+  fetch "$JDK8_LINUX_ARM64_URL" jdk8-linux-arm64.tar.gz
+  mkdir -p "$W/jdk8-linux-arm64"
+  tar -xzf "$CACHE/jdk8-linux-arm64.tar.gz" --strip-components=1 -C "$W/jdk8-linux-arm64"
+fi
 
 # Only include/win32/jni_md.h is needed: Windows JNICALL differs from the Linux header
 unzip -q "$CACHE/jdk8-windows.zip" '*/include/*' -d "$W/jdk8-windows-tmp"
@@ -162,13 +183,14 @@ rm -rf "$W/jdk8-windows-tmp"
 # The Bootlin tarballs are extracted inside a Linux container: macOS file systems are case-insensitive
 
 # ---------------------------------------------------------------------------------------------
-step "3/8 Mac (native, universal)"
+step "3/10 Mac (native, universal)"
+# Also needed by the Mac tests, which run for an already built Mac platform too
+if [[ "$("$CACHE/cmake3/bin/cmake" --version 2>/dev/null | head -1)" != "cmake version 3.28.4" ]]; then
+  rm -rf "$CACHE/cmake3"
+  python3 -m venv "$CACHE/cmake3"
+  "$CACHE/cmake3/bin/pip" install --quiet cmake==3.28.4
+fi
 if ! already_built Mac; then
-  if [[ "$("$CACHE/cmake3/bin/cmake" --version 2>/dev/null | head -1)" != "cmake version 3.28.4" ]]; then
-    rm -rf "$CACHE/cmake3"
-    python3 -m venv "$CACHE/cmake3"
-    "$CACHE/cmake3/bin/pip" install --quiet cmake==3.28.4
-  fi
   mkdir "$SRC/build-Mac"
   (
     cd "$SRC/build-Mac"
@@ -186,11 +208,14 @@ if ! already_built Mac; then
       build_version="$(otool -arch "$arch" -l jbinding-cpp/lib7-Zip-JBinding.dylib | grep -A3 LC_BUILD_VERSION)"
       [[ "$build_version" == *"minos 14.0"* ]] || fail "Mac $arch slice is not built for macOS 14.0"
     done
-    if [[ "${RUN_MAC_TESTS:-0}" == 1 ]]; then
-      "$CACHE/cmake3/bin/ctest" --output-on-failure
-    fi
     make package
   )
+fi
+
+# ---------------------------------------------------------------------------------------------
+if [[ "${RUN_MAC_TESTS:-0}" == 1 ]]; then
+  step "4/10 Test Mac (native)"
+  (cd "$SRC/build-Mac" && "$CACHE/cmake3/bin/ctest" --output-on-failure)
 fi
 
 # ---------------------------------------------------------------------------------------------
@@ -217,9 +242,9 @@ test -f "sevenzipjbinding-$VERSION-$P.zip"
 # $1 platform, $2 dockcross image with tag, $3 JAVA_SYSTEM, $4 JAVA_ARCH, $5 expected GCC version, $6 extra cmake flags,
 # $7 JDK 8 directory to mount (default: the 64-bit one)
 build_dockcross() {
-  step "4/8 $1 (docker.io/dockcross/$2)"
+  step "5/10 $1 (docker.io/dockcross/$2)"
   already_built "$1" && return 0
-  podman run --rm --platform linux/amd64 \
+  docker run --rm --platform linux/amd64 \
     -v "$SRC":/work -v "${7:-$W/jdk8-linux-x64}":/jdk8:ro -v "$W/jdk8-windows":/jdkwin:ro \
     -e P="$1" -e SYS="$3" -e ARCH="$4" -e EXPECTED_GCC="$5" -e EXTRA="${6:-}" -e JDK=/jdk8 -e VERSION="$VERSION" \
     "docker.io/dockcross/$2" bash -c "$CONTAINER_BUILD"
@@ -235,10 +260,10 @@ build_dockcross Windows-amd64 windows-static-x64:$DOCKCROSS_WINDOWS_TAG Windows 
 build_dockcross Windows-x86   windows-static-x86:$DOCKCROSS_WINDOWS_TAG Windows x86   9.2.0 "-DMINGW32=Yes -DJAVA_INCLUDE_PATH2=/jdkwin/include/win32"
 
 # ---------------------------------------------------------------------------------------------
-step "5/8 Linux-amd64-musl (alpine:3.12)"
+step "6/10 Linux-amd64-musl (alpine:3.12)"
 if ! already_built Linux-amd64-musl; then
   # /etc/apk/cache is apk's package cache when the directory exists
-  podman run --rm --platform linux/amd64 -v "$SRC":/work -v "$CACHE/apk":/etc/apk/cache \
+  docker run --rm --platform linux/amd64 -v "$SRC":/work -v "$CACHE/apk":/etc/apk/cache \
     -e P=Linux-amd64-musl -e SYS=Linux -e ARCH=amd64-musl -e EXPECTED_GCC=9.3.0 -e EXTRA= \
     -e C_CXX_FLAGS="$MUSL_DEFINES" \
     -e JDK=/usr/lib/jvm/java-1.8-openjdk -e VERSION="$VERSION" \
@@ -253,9 +278,9 @@ APT_KEEP_DEBS='rm -f /etc/apt/apt.conf.d/docker-clean'
 # ---------------------------------------------------------------------------------------------
 # $1 platform, $2 JAVA_ARCH, $3 Bootlin toolchain name
 build_bootlin() {
-  step "6/8 $1 (Bootlin $3)"
+  step "7/10 $1 (Bootlin $3)"
   already_built "$1" && return 0
-  podman run --rm --platform linux/amd64 -v "$SRC":/work -v "$W":/cross:ro -v "$CACHE":/cache:ro \
+  docker run --rm --platform linux/amd64 -v "$SRC":/work -v "$W":/cross:ro -v "$CACHE":/cache:ro \
     "${APT_CACHE_MOUNTS[@]}" \
     -e P="$1" -e SYS=Linux -e ARCH="$2" -e EXPECTED_GCC=8.4.0 -e EXTRA= -e JDK=/cross/jdk8-linux-x64 \
     -e VERSION="$VERSION" -e TC="$3" -e C_CXX_FLAGS="$BOOTLIN_DEFAULT_FLAGS $MUSL_DEFINES" \
@@ -275,13 +300,43 @@ build_bootlin Linux-arm64-musl arm64-musl "$BOOTLIN_AARCH64_MUSL"
 build_bootlin Linux-armv7-musl armv7-musl "$BOOTLIN_ARMV7_MUSL"
 
 # ---------------------------------------------------------------------------------------------
-step "7/8 Merge into AllPlatforms"
+# ctest runs from the build directory with the paths recorded at build time: sources in /work,
+# /usr/bin/cmake and the configured JDK's bin/java, which must match the target architecture.
+# $1 platform, $2 docker platform, $3 image, $4 setup commands; the remaining arguments go to docker run
+test_linux() {
+  local p="$1" arch="$2" image="$3" setup="$4"
+  shift 4
+  step "8/10 Test $p ($image, $arch)"
+  docker run --rm --platform "$arch" -v "$SRC":/work "$@" "$image" \
+    sh -c "set -eux; $setup; cd /work/build-$p && ctest --output-on-failure"
+}
+
+if [[ "${RUN_LINUX_TESTS:-0}" == 1 ]]; then
+  APT_CMAKE="$APT_KEEP_DEBS; apt-get update; apt-get install -y --no-install-recommends cmake"
+  APT_CACHE_MOUNTS_ARM64=(-v "$CACHE/apt-archives-arm64":/var/cache/apt/archives
+                          -v "$CACHE/apt-lists-arm64":/var/lib/apt/lists)
+  APK_CMAKE_JDK='apk update; apk add cmake openjdk8'
+  # The dockcross builds ran with the JDK in /jdk8
+  test_linux Linux-amd64 linux/amd64 docker.io/library/debian:bookworm "$APT_CMAKE" \
+    "${APT_CACHE_MOUNTS[@]}" -v "$W/jdk8-linux-x64":/jdk8:ro
+  test_linux Linux-arm64 linux/arm64 docker.io/library/debian:bookworm "$APT_CMAKE" \
+    "${APT_CACHE_MOUNTS_ARM64[@]}" -v "$W/jdk8-linux-arm64":/jdk8:ro
+  test_linux Linux-amd64-musl linux/amd64 docker.io/library/alpine:3.12 "$APK_CMAKE_JDK" \
+    -v "$CACHE/apk":/etc/apk/cache
+  # The Bootlin build ran with the x64 glibc JDK in /cross/jdk8-linux-x64; musl needs Alpine's JDK
+  test_linux Linux-arm64-musl linux/arm64 docker.io/library/alpine:3.12 \
+    "$APK_CMAKE_JDK; mkdir -p /cross; ln -s /usr/lib/jvm/java-1.8-openjdk /cross/jdk8-linux-x64" \
+    -v "$CACHE/apk-arm64":/etc/apk/cache
+fi
+
+# ---------------------------------------------------------------------------------------------
+step "9/10 Merge into AllPlatforms"
 for p in "${PLATFORMS[@]}"; do
   zip="$SRC/build-$p/sevenzipjbinding-$VERSION-$p.zip"
   [[ -f "$zip" ]] || fail "missing $zip"
   cp "$zip" "$W/dist/"
 done
-podman run --rm --platform linux/amd64 -v "$SRC":/src:ro -v "$W":/w "${APT_CACHE_MOUNTS[@]}" -e VERSION="$VERSION" \
+docker run --rm --platform linux/amd64 -v "$SRC":/src:ro -v "$W":/w "${APT_CACHE_MOUNTS[@]}" -e VERSION="$VERSION" \
   docker.io/library/debian:bookworm bash -c "$APT_KEEP_DEBS"'
     set -eux
     apt-get update
@@ -289,12 +344,12 @@ podman run --rm --platform linux/amd64 -v "$SRC":/src:ro -v "$W":/w "${APT_CACHE
     export PATH=/w/jdk8-linux-x64/bin:$PATH
     cd /w/dist
     bash /src/scripts/build-multiplatform-release.sh sevenzipjbinding-$VERSION-*.zip'
-RESULT="$W/out/sevenzipjbinding-all-platforms-$VERSION.jar"
+RESULT="$W/out/sevenzipjbinding-all-platforms-$RESULT_VERSION.jar"
 unzip -p "$W/dist/sevenzipjbinding-$VERSION-AllPlatforms.zip" \
   "sevenzipjbinding-$VERSION-AllPlatforms/lib/sevenzipjbinding-AllPlatforms.jar" > "$RESULT"
 
 # ---------------------------------------------------------------------------------------------
-step "8/8 Verify result"
+step "10/10 Verify result"
 mkdir "$W/verify"
 unzip -q "$RESULT" -d "$W/verify"
 [[ "$(grep -c '^platform\.' "$W/verify/sevenzipjbinding-platforms.properties")" == "${#PLATFORMS[@]}" ]] \
@@ -307,6 +362,13 @@ for p in "${PLATFORMS[@]}"; do
 done
 rm -rf "$W/verify"
 
+# ---------------------------------------------------------------------------------------------
+# The project version is the only <version> equal to $VERSION (plugin versions differ)
+POM="$W/out/sevenzipjbinding-all-platforms-$RESULT_VERSION.pom"
+sed "s|<version>${VERSION//./\\.}</version>|<version>$RESULT_VERSION</version>|" "$POM_TEMPLATE" > "$POM"
+grep -qF "<version>$RESULT_VERSION</version>" "$POM" || fail "version not set in $POM"
+
 echo
 echo "Result: $RESULT"
-echo "Built platforms are kept in $SRC/build-*; run \"$0 cleanup\" to remove everything"
+echo "POM:    $POM"
+echo "Built platforms are kept in $SRC/build-*; run \"$0 cleanup\" to remove them"
